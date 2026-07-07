@@ -41,7 +41,12 @@ from vllm.utils.gc_utils import (
 )
 from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
-from vllm.utils.system_utils import decorate_logs, set_process_title
+from vllm.utils.system_utils import (
+    arm_fatal_exit_watchdog,
+    decorate_logs,
+    force_exit,
+    set_process_title,
+)
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     generate_scheduler_kv_cache_config,
@@ -1159,6 +1164,7 @@ class EngineCoreProc(EngineCore):
 
         engine_core: EngineCoreProc | None = None
         signal_callback: SignalCallback | None = None
+        fatal_exit = False
         try:
             vllm_config: VllmConfig = kwargs["vllm_config"]
             parallel_config: ParallelConfig = vllm_config.parallel_config
@@ -1227,6 +1233,12 @@ class EngineCoreProc(EngineCore):
             logger.info_once("[shutdown] EngineCore: exiting busy loop")
             raise
         except Exception as e:
+            fatal_exit = True
+            # Arm before any cleanup: engine_core.shutdown() below can hang
+            # in distributed teardown (e.g. NCCL/KV-connector) when the
+            # engine is partially initialized or other ranks are
+            # mid-collective (#46509).
+            arm_fatal_exit_watchdog(reason="EngineCore fatal error")
             if engine_core is None:
                 logger.exception("EngineCore failed to start.")
             else:
@@ -1240,6 +1252,13 @@ class EngineCoreProc(EngineCore):
                 signal_callback.stop()
             if engine_core is not None:
                 engine_core.shutdown()
+            if fatal_exit:
+                # Never fall through to interpreter exit after a fatal error:
+                # finalization can hang in native destructors, leaving a
+                # zombie process. The parent frontend only reacts to this
+                # process's sentinel (wait_for_engine_startup), so guarantee
+                # actual process death (#46509).
+                force_exit(1, "EngineCore fatal error")
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass

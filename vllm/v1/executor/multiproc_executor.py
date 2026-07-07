@@ -54,7 +54,9 @@ from vllm.utils.network_utils import (
 from vllm.utils.ompmultiprocessing import OMPProcessManager
 from vllm.utils.system_utils import (
     _maybe_force_spawn,
+    arm_fatal_exit_watchdog,
     decorate_logs,
+    force_exit,
     get_mp_context,
     set_process_title,
 )
@@ -292,6 +294,13 @@ class MultiprocExecutor(Executor):
             if callback is not None:
                 _self.failure_callback = None
                 callback()
+            # The callback only enqueues an EXECUTOR_FAILED notification; if
+            # the engine main thread is wedged (e.g. in a collective or in
+            # MessageQueue.acquire_write, which has no shutdown escape), it
+            # will never process it. Guarantee this engine process still
+            # exits so the frontend/supervisor recovery chain can react to
+            # its death (#46509).
+            arm_fatal_exit_watchdog(reason="Worker process died unexpectedly")
 
         if not inline:
             Thread(
@@ -795,6 +804,12 @@ class WorkerProc:
                 for mq in queues_to_shutdown:
                     if mq is not None:
                         mq.shutdown()
+                # The queue shutdown above only unblocks threads waiting on
+                # the queues. If the worker main thread is wedged in a native
+                # call (e.g. a collective that will never complete because
+                # the parent died), guarantee this orphaned process still
+                # exits (#46509).
+                arm_fatal_exit_watchdog(reason="WorkerProc parent process exited")
             except Exception as e:
                 logger.warning("Death monitoring error: %s", e)
 
@@ -843,6 +858,7 @@ class WorkerProc:
         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
 
         worker = None
+        fatal_exit = False
         ready_writer = kwargs.pop("ready_pipe")
         death_pipe = kwargs.pop("death_pipe", None)
 
@@ -899,12 +915,20 @@ class WorkerProc:
 
             if ready_writer is not None:
                 logger.exception("WorkerProc failed to start.")
+                fatal_exit = True
             elif shutdown_requested.is_set():
                 logger.debug_once(
                     "[shutdown] WorkerProc: exiting after shutdown request"
                 )
             else:
                 logger.exception("WorkerProc failed.")
+                fatal_exit = True
+
+            if fatal_exit:
+                # Cover hangs in worker.shutdown() below: native teardown
+                # (e.g. NCCL/NVSHMEM/DeepEP) can block indefinitely when
+                # other ranks are mid-collective (#46509).
+                arm_fatal_exit_watchdog(reason="WorkerProc fatal error")
 
             # The parent sends a SIGTERM to all worker processes if
             # any worker dies. Set this value so we don't re-throw
@@ -931,6 +955,12 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+            if fatal_exit:
+                # Never fall through to interpreter exit after a fatal error:
+                # finalization can hang in native destructors (e.g. gRPC,
+                # deep_gemm), leaving a zombie process that the parent only
+                # detects via its sentinel (#46509).
+                force_exit(1, "WorkerProc fatal error")
 
     class ResponseStatus(Enum):
         SUCCESS = auto()

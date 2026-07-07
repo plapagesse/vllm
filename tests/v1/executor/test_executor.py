@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import multiprocessing
 import os
 from collections.abc import Callable
 from concurrent.futures import Future
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -86,6 +89,40 @@ def test_multiproc_executor_worker_termination_timeout(
     proc = _FakeProcess(clock, exits_at=exits_at)
     executor._ensure_worker_termination([proc])
     assert proc.terminate_called is expected_terminate
+
+
+def _exit_immediately():
+    pass
+
+
+def test_multiproc_executor_monitor_arms_fatal_exit_watchdog(monkeypatch):
+    """When a worker dies unexpectedly, the monitor must (in addition to
+    shutting down and notifying the engine) arm the fatal-exit watchdog so
+    an engine process wedged in a collective still exits (#46509)."""
+    watchdog = MagicMock()
+    monkeypatch.setattr(multiproc_executor_module, "arm_fatal_exit_watchdog", watchdog)
+
+    # A real process that has already exited, so its sentinel is signaled.
+    proc = multiprocessing.get_context("spawn").Process(target=_exit_immediately)
+    proc.start()
+    proc.join(30)
+    assert proc.exitcode == 0
+
+    executor = MultiprocExecutor.__new__(MultiprocExecutor)
+    executor.shutting_down = False
+    executor.is_failed = False
+    executor.shutdown = MagicMock()
+    failure_callback = MagicMock()
+    executor.failure_callback = failure_callback
+    executor.workers = [SimpleNamespace(proc=proc)]
+
+    executor.start_worker_monitor(inline=True)
+
+    assert executor.is_failed
+    executor.shutdown.assert_called_once()
+    failure_callback.assert_called_once()
+    assert executor.failure_callback is None
+    watchdog.assert_called_once()
 
 
 class CustomMultiprocExecutor(MultiprocExecutor):

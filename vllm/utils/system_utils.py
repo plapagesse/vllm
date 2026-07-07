@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import multiprocessing
 import os
 import signal
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import TextIO
+from typing import NoReturn, TextIO
 
 import psutil
 
@@ -276,6 +278,50 @@ def kill_process_tree(pid: int):
     # Finally kill the parent
     with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGKILL)
+
+
+def flush_logs() -> None:
+    """Best-effort flush of logging handlers and std streams."""
+    with contextlib.suppress(Exception):
+        for log in (logging.getLogger(), logging.getLogger("vllm")):
+            for handler in log.handlers:
+                handler.flush()
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+
+def force_exit(exit_code: int, reason: str) -> NoReturn:
+    """Terminate this process immediately via os._exit.
+
+    This bypasses interpreter finalization, atexit handlers and native-library
+    destructors. Only for fatal-error paths where normal teardown may hang
+    indefinitely (e.g. NCCL/NVSHMEM/DeepEP/gRPC teardown while other ranks are
+    mid-collective).
+    """
+    logger.error("Force-exiting process with code %d: %s", exit_code, reason)
+    flush_logs()
+    os._exit(exit_code)
+
+
+def arm_fatal_exit_watchdog(reason: str, exit_code: int = 1) -> threading.Timer:
+    """Arm a daemon timer that force-exits this process if it is still alive
+    after VLLM_FATAL_EXIT_TIMEOUT_SECONDS.
+
+    Used on fatal-error paths before attempting best-effort cleanup, so that
+    cleanup which hangs (e.g. distributed teardown mid-collective) cannot keep
+    the process alive forever. The timer thread is a daemon, so it never
+    delays a faster natural exit.
+    """
+    timeout = envs.VLLM_FATAL_EXIT_TIMEOUT_SECONDS
+    timer = threading.Timer(
+        timeout,
+        force_exit,
+        args=(exit_code, f"{reason}: cleanup did not finish within {timeout}s"),
+    )
+    timer.daemon = True
+    timer.name = "VllmFatalExitWatchdog"
+    timer.start()
+    return timer
 
 
 # Resource utilities

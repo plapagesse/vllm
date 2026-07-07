@@ -3,6 +3,7 @@
 """Test that we handle a startup Error and shutdown."""
 
 import inspect
+import time
 
 import pytest
 
@@ -17,6 +18,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.core import EngineCore
 
 MODELS = ["hmellor/tiny-random-LlamaForCausalLM"]
 
@@ -74,6 +76,41 @@ def test_async_llm_startup_error(
     # Confirm all the processes are cleaned up.
     wait_for_gpu_memory_to_clear(
         devices=list(range(tensor_parallel_size)),
+        threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
+    )
+
+
+def hanging_shutdown(self):
+    """Simulates EngineCore cleanup wedging in distributed teardown after a
+    fatal startup error (e.g. NCCL/DeepEP native hang, see #46509)."""
+    time.sleep(300)
+
+
+@pytest.mark.skipif(
+    current_platform.is_rocm(),
+    reason="Relies on fork-based monkeypatching of the engine-core process",
+)
+@pytest.mark.timeout(SHUTDOWN_TEST_TIMEOUT_SEC)
+@pytest.mark.parametrize("model", MODELS)
+def test_async_llm_startup_error_exits_despite_hanging_shutdown(
+    monkeypatch,
+    model: str,
+) -> None:
+    """A fatal startup error whose cleanup hangs must still kill the
+    EngineCore process (via the fatal-exit watchdog) so that the frontend
+    observes startup failure instead of blocking forever (#46509)."""
+    # Fail during weight loading, and make the engine's cleanup hang.
+    monkeypatch.setattr(LlamaForCausalLM, "load_weights", evil_method)
+    monkeypatch.setattr(EngineCore, "shutdown", hanging_shutdown)
+    monkeypatch.setenv("VLLM_FATAL_EXIT_TIMEOUT_SECONDS", "5")
+
+    engine_args = AsyncEngineArgs(model=model, enforce_eager=True)
+
+    with pytest.raises(Exception, match=r"initialization fail(ed|ure)"):
+        _ = AsyncLLM.from_engine_args(engine_args)
+
+    wait_for_gpu_memory_to_clear(
+        devices=[0],
         threshold_bytes=SHUTDOWN_TEST_THRESHOLD_BYTES,
     )
 
